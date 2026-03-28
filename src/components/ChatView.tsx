@@ -15,16 +15,66 @@ interface ParsedCommitment {
   deadline: string;
 }
 
+function resolveRelativeDate(whenStr: string): string {
+  // Parse "today 20:00" or "tomorrow 06:00" or "monday 08:00"
+  const parts = whenStr.trim().toLowerCase().split(/\s+/);
+  if (parts.length < 2) return new Date().toISOString();
+
+  const dayWord = parts[0];
+  const timePart = parts[1]; // "HH:MM"
+  const [hours, minutes] = timePart.split(":").map(Number);
+
+  const now = new Date();
+  const target = new Date();
+  target.setHours(hours || 0, minutes || 0, 0, 0);
+
+  const dayMap: Record<string, number> = {
+    sunday: 0, monday: 1, tuesday: 2, wednesday: 3,
+    thursday: 4, friday: 5, saturday: 6,
+  };
+
+  if (dayWord === "today") {
+    // Already set to today
+  } else if (dayWord === "tomorrow") {
+    target.setDate(target.getDate() + 1);
+  } else if (dayMap[dayWord] !== undefined) {
+    const targetDay = dayMap[dayWord];
+    const currentDay = now.getDay();
+    let daysAhead = targetDay - currentDay;
+    if (daysAhead <= 0) daysAhead += 7; // Next week if today or past
+    target.setDate(target.getDate() + daysAhead);
+  }
+
+  return target.toISOString();
+}
+
 function parseCommitment(content: string): ParsedCommitment | null {
-  const match = content.match(
+  // Try new format first: [COMMITMENT: desc | WHEN: relative_day HH:MM]
+  const newMatch = content.match(
+    /\[COMMITMENT:\s*(.+?)\s*\|\s*WHEN:\s*(.+?)\s*\]/
+  );
+  if (newMatch) {
+    return {
+      description: newMatch[1],
+      deadline: resolveRelativeDate(newMatch[2]),
+    };
+  }
+
+  // Fallback to old format: [COMMITMENT: desc | DEADLINE: YYYY-MM-DD HH:MM]
+  const oldMatch = content.match(
     /\[COMMITMENT:\s*(.+?)\s*\|\s*DEADLINE:\s*(.+?)\s*\]/
   );
-  if (!match) return null;
-  return { description: match[1], deadline: match[2] };
+  if (oldMatch) {
+    return { description: oldMatch[1], deadline: new Date(oldMatch[2]).toISOString() };
+  }
+
+  return null;
 }
 
 function stripCommitmentTag(content: string): string {
-  return content.replace(/\[COMMITMENT:\s*.+?\|\s*DEADLINE:\s*.+?\]/, "").trim();
+  return content
+    .replace(/\[COMMITMENT:\s*.+?\|\s*(?:DEADLINE|WHEN):\s*.+?\]/, "")
+    .trim();
 }
 
 function CommitmentCard({
