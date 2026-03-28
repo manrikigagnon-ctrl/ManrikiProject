@@ -122,23 +122,48 @@ export default function ChatView() {
   const [dismissedCommitments, setDismissedCommitments] = useState<Set<string>>(
     new Set()
   );
+  const [error, setError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const isLoadingRef = useRef(false);
 
-  useEffect(() => {
-    async function loadMessages() {
-      const { data } = await supabase
+  // Load messages from Supabase
+  const loadMessages = useCallback(async () => {
+    try {
+      const { data, error: fetchError } = await supabase
         .from("messages")
         .select("*")
         .order("created_at", { ascending: true })
         .limit(50);
 
+      if (fetchError) {
+        console.error("Failed to load messages:", fetchError);
+        return;
+      }
+
       if (data) setMessages(data);
-      setIsInitialLoad(false);
+    } catch (err) {
+      console.error("Error loading messages:", err);
     }
-    loadMessages();
   }, []);
 
+  // Load on mount
+  useEffect(() => {
+    loadMessages().then(() => setIsInitialLoad(false));
+  }, [loadMessages]);
+
+  // Poll for new messages every 5 seconds when not loading
+  // This ensures mobile catches up if a response was missed
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!isLoadingRef.current) {
+        loadMessages();
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [loadMessages]);
+
+  // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
@@ -177,8 +202,10 @@ export default function ChatView() {
     if (!trimmed || isLoading) return;
 
     setInput("");
+    setError(null);
     if (inputRef.current) inputRef.current.style.height = "auto";
 
+    // Optimistic UI: show user message immediately
     const tempUserMsg: Message = {
       id: "temp-user-" + Date.now(),
       role: "user",
@@ -187,37 +214,62 @@ export default function ChatView() {
     };
     setMessages((prev) => [...prev, tempUserMsg]);
     setIsLoading(true);
+    isLoadingRef.current = true;
 
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: trimmed }),
-      });
+    // Retry logic — try up to 2 times
+    let attempts = 0;
+    const maxAttempts = 2;
 
-      const data = await res.json();
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        const controller = new AbortController();
+        // 30 second timeout — generous for mobile connections
+        const timeout = setTimeout(() => controller.abort(), 30000);
 
-      if (data.message) {
-        const assistantMsg: Message = {
-          id: "temp-ai-" + Date.now(),
-          role: "assistant",
-          content: data.message,
-          created_at: new Date().toISOString(),
-        };
-        setMessages((prev) => [...prev, assistantMsg]);
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: trimmed }),
+          signal: controller.signal,
+          keepalive: true, // Helps with mobile background issues
+        });
+
+        clearTimeout(timeout);
+
+        const data = await res.json();
+
+        if (data.message) {
+          const assistantMsg: Message = {
+            id: "temp-ai-" + Date.now(),
+            role: "assistant",
+            content: data.message,
+            created_at: new Date().toISOString(),
+          };
+          setMessages((prev) => [...prev, assistantMsg]);
+          setIsLoading(false);
+          isLoadingRef.current = false;
+          return; // Success — exit the retry loop
+        } else if (data.error) {
+          throw new Error(data.error);
+        }
+      } catch (err) {
+        console.error(`Attempt ${attempts} failed:`, err);
+
+        if (attempts >= maxAttempts) {
+          // Final attempt failed — try loading from DB in case response was saved server-side
+          await new Promise((r) => setTimeout(r, 2000));
+          await loadMessages();
+          setError("Response may have been delayed. Messages synced from server.");
+        } else {
+          // Wait 2 seconds before retrying
+          await new Promise((r) => setTimeout(r, 2000));
+        }
       }
-    } catch (err) {
-      console.error("Failed to send message:", err);
-      const errorMsg: Message = {
-        id: "error-" + Date.now(),
-        role: "assistant",
-        content: "Connection issue. Check your API keys and try again.",
-        created_at: new Date().toISOString(),
-      };
-      setMessages((prev) => [...prev, errorMsg]);
-    } finally {
-      setIsLoading(false);
     }
+
+    setIsLoading(false);
+    isLoadingRef.current = false;
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -296,6 +348,19 @@ export default function ChatView() {
               <div className="typing-dot" />
               <div className="typing-dot" />
             </div>
+          </div>
+        )}
+
+        {error && (
+          <div
+            style={{
+              textAlign: "center",
+              fontSize: "12px",
+              color: "var(--text-tertiary)",
+              padding: "8px",
+            }}
+          >
+            {error}
           </div>
         )}
 
