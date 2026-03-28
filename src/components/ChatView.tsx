@@ -111,7 +111,7 @@ function CommitmentCard({
   );
 }
 
-export default function ChatView() {
+export default function ChatView({ intensity = 3 }: { intensity?: number }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -127,7 +127,6 @@ export default function ChatView() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const isLoadingRef = useRef(false);
 
-  // Load messages from Supabase
   const loadMessages = useCallback(async () => {
     try {
       const { data, error: fetchError } = await supabase
@@ -147,13 +146,11 @@ export default function ChatView() {
     }
   }, []);
 
-  // Load on mount
   useEffect(() => {
     loadMessages().then(() => setIsInitialLoad(false));
   }, [loadMessages]);
 
-  // Poll for new messages every 5 seconds when not loading
-  // This ensures mobile catches up if a response was missed
+  // Poll for new messages
   useEffect(() => {
     const interval = setInterval(() => {
       if (!isLoadingRef.current) {
@@ -163,7 +160,15 @@ export default function ChatView() {
     return () => clearInterval(interval);
   }, [loadMessages]);
 
-  // Auto-scroll
+  // Listen for weekly report trigger from settings
+  useEffect(() => {
+    const handleWeeklyReport = () => {
+      requestWeeklyReport();
+    };
+    window.addEventListener("manriki-weekly-report", handleWeeklyReport);
+    return () => window.removeEventListener("manriki-weekly-report", handleWeeklyReport);
+  }, [intensity]);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
@@ -197,6 +202,51 @@ export default function ChatView() {
     setDismissedCommitments((prev) => new Set(prev).add(msgId));
   };
 
+  const requestWeeklyReport = async () => {
+    if (isLoading) return;
+
+    const reportMsg: Message = {
+      id: "temp-report-user-" + Date.now(),
+      role: "user",
+      content: "Show me my weekly report",
+      created_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, reportMsg]);
+    setIsLoading(true);
+    isLoadingRef.current = true;
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: "Show me my weekly report",
+          intensity,
+          weeklyReport: true,
+        }),
+        keepalive: true,
+      });
+
+      const data = await res.json();
+
+      if (data.message) {
+        const assistantMsg: Message = {
+          id: "temp-report-ai-" + Date.now(),
+          role: "assistant",
+          content: data.message,
+          created_at: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+      }
+    } catch (err) {
+      console.error("Failed to get weekly report:", err);
+      await loadMessages();
+    } finally {
+      setIsLoading(false);
+      isLoadingRef.current = false;
+    }
+  };
+
   const sendMessage = async () => {
     const trimmed = input.trim();
     if (!trimmed || isLoading) return;
@@ -205,7 +255,6 @@ export default function ChatView() {
     setError(null);
     if (inputRef.current) inputRef.current.style.height = "auto";
 
-    // Optimistic UI: show user message immediately
     const tempUserMsg: Message = {
       id: "temp-user-" + Date.now(),
       role: "user",
@@ -216,7 +265,6 @@ export default function ChatView() {
     setIsLoading(true);
     isLoadingRef.current = true;
 
-    // Retry logic — try up to 2 times
     let attempts = 0;
     const maxAttempts = 2;
 
@@ -224,15 +272,14 @@ export default function ChatView() {
       attempts++;
       try {
         const controller = new AbortController();
-        // 30 second timeout — generous for mobile connections
         const timeout = setTimeout(() => controller.abort(), 30000);
 
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: trimmed }),
+          body: JSON.stringify({ message: trimmed, intensity }),
           signal: controller.signal,
-          keepalive: true, // Helps with mobile background issues
+          keepalive: true,
         });
 
         clearTimeout(timeout);
@@ -249,7 +296,7 @@ export default function ChatView() {
           setMessages((prev) => [...prev, assistantMsg]);
           setIsLoading(false);
           isLoadingRef.current = false;
-          return; // Success — exit the retry loop
+          return;
         } else if (data.error) {
           throw new Error(data.error);
         }
@@ -257,12 +304,10 @@ export default function ChatView() {
         console.error(`Attempt ${attempts} failed:`, err);
 
         if (attempts >= maxAttempts) {
-          // Final attempt failed — try loading from DB in case response was saved server-side
           await new Promise((r) => setTimeout(r, 2000));
           await loadMessages();
           setError("Response may have been delayed. Messages synced from server.");
         } else {
-          // Wait 2 seconds before retrying
           await new Promise((r) => setTimeout(r, 2000));
         }
       }
@@ -290,7 +335,11 @@ export default function ChatView() {
         <div className="chat-header-icon">M</div>
         <div className="chat-header-info">
           <h1>Manriki</h1>
-          <span>{isLoading ? "thinking..." : "accountability coach"}</span>
+          <span>
+            {isLoading
+              ? "thinking..."
+              : `intensity ${intensity}/5`}
+          </span>
         </div>
       </div>
 

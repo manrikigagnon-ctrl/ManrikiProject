@@ -4,6 +4,8 @@ import { createClient } from "@supabase/supabase-js";
 import {
   getSystemPrompt,
   buildContextMessage,
+  generateWeeklyReportPrompt,
+  CoachingIntensity,
 } from "@/lib/coaching";
 
 const anthropic = new Anthropic({
@@ -17,23 +19,15 @@ const supabase = createClient(
 
 export async function POST(req: NextRequest) {
   try {
-    const { message } = await req.json();
+    const body = await req.json();
+    const { message, intensity = 3, weeklyReport = false } = body;
 
     if (!message || typeof message !== "string") {
       return NextResponse.json({ error: "Message is required" }, { status: 400 });
     }
 
-    // Save user message
-    await supabase.from("messages").insert({ role: "user", content: message });
-
-    // Fetch context: recent messages (limited to last 20 to prevent loops),
-    // commitments, and check-ins
-    const [messagesRes, commitmentsRes, checkInsRes] = await Promise.all([
-      supabase
-        .from("messages")
-        .select("role, content")
-        .order("created_at", { ascending: false })
-        .limit(20),
+    // Fetch commitments and check-ins for context
+    const [commitmentsRes, checkInsRes] = await Promise.all([
       supabase
         .from("commitments")
         .select("id, description, deadline, status, times_rescheduled, missed_reason")
@@ -46,10 +40,6 @@ export async function POST(req: NextRequest) {
         .limit(15),
     ]);
 
-    // Reverse so they're in chronological order, and skip the message we just saved
-    const recentMessages = (messagesRes.data || []).reverse();
-
-    // Build commitment context
     const commitments = commitmentsRes.data || [];
     const checkIns = (checkInsRes.data || []).map((ci) => {
       const commitment = commitments.find((c) => c.id === ci.commitment_id);
@@ -62,19 +52,50 @@ export async function POST(req: NextRequest) {
       };
     });
 
+    // If weekly report requested, use the report prompt
+    if (weeklyReport) {
+      const reportPrompt = generateWeeklyReportPrompt(commitments, checkIns);
+
+      const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 400,
+        system: getSystemPrompt(intensity as CoachingIntensity),
+        messages: [{ role: "user", content: reportPrompt }],
+      });
+
+      const reportContent =
+        response.content[0].type === "text" ? response.content[0].text : "";
+
+      // Save as messages
+      await supabase.from("messages").insert({ role: "user", content: "Show me my weekly report" });
+      await supabase.from("messages").insert({ role: "assistant", content: reportContent });
+
+      return NextResponse.json({ message: reportContent });
+    }
+
+    // Normal chat flow
+    // Save user message
+    await supabase.from("messages").insert({ role: "user", content: message });
+
+    // Fetch recent messages
+    const messagesRes = await supabase
+      .from("messages")
+      .select("role, content")
+      .order("created_at", { ascending: false })
+      .limit(20);
+
+    const recentMessages = (messagesRes.data || []).reverse();
+
     const contextMessage = buildContextMessage(commitments, checkIns);
 
-    // Build messages for Claude — keep it clean and simple
-    // First message includes context, then conversation history follows
-    const conversationHistory = recentMessages.slice(0, -1); // exclude the message we just saved
+    // Build messages for Claude
+    const conversationHistory = recentMessages.slice(0, -1);
 
     let finalMessages: { role: "user" | "assistant"; content: string }[] = [];
 
     if (conversationHistory.length > 0) {
-      // Take only the last 16 messages to keep context focused
       const trimmedHistory = conversationHistory.slice(-16);
 
-      // Ensure the first message is from the user (required by Claude API)
       let startIdx = 0;
       for (let i = 0; i < trimmedHistory.length; i++) {
         if (trimmedHistory[i].role === "user") {
@@ -85,17 +106,14 @@ export async function POST(req: NextRequest) {
 
       const validHistory = trimmedHistory.slice(startIdx);
 
-      // Build final messages: context injected into first user message
       if (validHistory.length > 0 && validHistory[0].role === "user") {
         finalMessages.push({
           role: "user",
           content: `[CONTEXT]\n${contextMessage}\n[/CONTEXT]\n\n${validHistory[0].content}`,
         });
 
-        // Add remaining history
         for (let i = 1; i < validHistory.length; i++) {
           const msg = validHistory[i];
-          // Ensure alternating roles — merge if same role appears twice
           if (
             finalMessages.length > 0 &&
             finalMessages[finalMessages.length - 1].role === msg.role
@@ -109,7 +127,6 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        // Add current message
         const lastMsg = finalMessages[finalMessages.length - 1];
         if (lastMsg.role === "user") {
           lastMsg.content += "\n" + message;
@@ -117,7 +134,6 @@ export async function POST(req: NextRequest) {
           finalMessages.push({ role: "user", content: message });
         }
       } else {
-        // Fallback: just send context + current message
         finalMessages = [
           {
             role: "user",
@@ -126,7 +142,6 @@ export async function POST(req: NextRequest) {
         ];
       }
     } else {
-      // First message ever
       finalMessages = [
         {
           role: "user",
@@ -135,18 +150,16 @@ export async function POST(req: NextRequest) {
       ];
     }
 
-    // Call Claude
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 300, // Reduced from 500 to enforce brevity
-      system: getSystemPrompt(),
+      max_tokens: 300,
+      system: getSystemPrompt(intensity as CoachingIntensity),
       messages: finalMessages,
     });
 
     const assistantMessage =
       response.content[0].type === "text" ? response.content[0].text : "";
 
-    // Save assistant response
     await supabase
       .from("messages")
       .insert({ role: "assistant", content: assistantMessage });
