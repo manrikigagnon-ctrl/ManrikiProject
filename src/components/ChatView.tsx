@@ -261,7 +261,24 @@ export default function ChatView({ intensity = 3 }: { intensity?: number }) {
   );
 
   const saveCommitment = async (msgId: string, commitment: ParsedCommitment) => {
+    // Immediately mark as saved in local state (optimistic update)
+    setSavedCommitments((prev) => new Set(prev).add(msgId));
+
+    // Immediately update the message content locally so polling doesn't reset it
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === msgId
+          ? {
+              ...m,
+              content: m.content
+                .replace("[COMMITMENT:", "[SAVED_COMMITMENT:")
+            }
+          : m
+      )
+    );
+
     try {
+      // Save the commitment to the commitments table
       await fetch("/api/commitments", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -270,27 +287,24 @@ export default function ChatView({ intensity = 3 }: { intensity?: number }) {
           deadline: commitment.deadline,
         }),
       });
-      setSavedCommitments((prev) => new Set(prev).add(msgId));
 
-      // Mark as saved in Supabase so it persists across tab switches
+      // Update the message in Supabase so it persists across sessions
       const msg = messages.find((m) => m.id === msgId);
       if (msg) {
-        const updatedContent = msg.content
-          .replace(/\[COMMITMENT:/, "[SAVED_COMMITMENT:")
-          .replace(/\[COMMITMENT:/, "[SAVED_COMMITMENT:");
+        const updatedContent = msg.content.replace("[COMMITMENT:", "[SAVED_COMMITMENT:");
         await supabase
           .from("messages")
           .update({ content: updatedContent })
           .eq("id", msgId);
-        // Update local state too
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === msgId ? { ...m, content: updatedContent } : m
-          )
-        );
       }
     } catch (err) {
       console.error("Failed to save commitment:", err);
+      // Revert on failure
+      setSavedCommitments((prev) => {
+        const next = new Set(prev);
+        next.delete(msgId);
+        return next;
+      });
     }
   };
 
