@@ -13,15 +13,15 @@ interface Message {
 interface ParsedCommitment {
   description: string;
   deadline: string;
+  alreadySaved: boolean;
 }
 
 function resolveRelativeDate(whenStr: string): string {
-  // Parse "today 20:00" or "tomorrow 06:00" or "monday 08:00"
   const parts = whenStr.trim().toLowerCase().split(/\s+/);
   if (parts.length < 2) return new Date().toISOString();
 
   const dayWord = parts[0];
-  const timePart = parts[1]; // "HH:MM"
+  const timePart = parts[1];
   const [hours, minutes] = timePart.split(":").map(Number);
 
   const now = new Date();
@@ -41,7 +41,7 @@ function resolveRelativeDate(whenStr: string): string {
     const targetDay = dayMap[dayWord];
     const currentDay = now.getDay();
     let daysAhead = targetDay - currentDay;
-    if (daysAhead <= 0) daysAhead += 7; // Next week if today or past
+    if (daysAhead <= 0) daysAhead += 7;
     target.setDate(target.getDate() + daysAhead);
   }
 
@@ -49,7 +49,30 @@ function resolveRelativeDate(whenStr: string): string {
 }
 
 function parseCommitment(content: string): ParsedCommitment | null {
-  // Try new format first: [COMMITMENT: desc | WHEN: relative_day HH:MM]
+  // Check for already-saved commitments first
+  const savedNewMatch = content.match(
+    /\[SAVED_COMMITMENT:\s*(.+?)\s*\|\s*WHEN:\s*(.+?)\s*\]/
+  );
+  if (savedNewMatch) {
+    return {
+      description: savedNewMatch[1],
+      deadline: resolveRelativeDate(savedNewMatch[2]),
+      alreadySaved: true,
+    };
+  }
+
+  const savedOldMatch = content.match(
+    /\[SAVED_COMMITMENT:\s*(.+?)\s*\|\s*DEADLINE:\s*(.+?)\s*\]/
+  );
+  if (savedOldMatch) {
+    return {
+      description: savedOldMatch[1],
+      deadline: new Date(savedOldMatch[2]).toISOString(),
+      alreadySaved: true,
+    };
+  }
+
+  // New format: [COMMITMENT: desc | WHEN: relative_day HH:MM]
   const newMatch = content.match(
     /\[COMMITMENT:\s*(.+?)\s*\|\s*WHEN:\s*(.+?)\s*\]/
   );
@@ -57,15 +80,20 @@ function parseCommitment(content: string): ParsedCommitment | null {
     return {
       description: newMatch[1],
       deadline: resolveRelativeDate(newMatch[2]),
+      alreadySaved: false,
     };
   }
 
-  // Fallback to old format: [COMMITMENT: desc | DEADLINE: YYYY-MM-DD HH:MM]
+  // Old format: [COMMITMENT: desc | DEADLINE: YYYY-MM-DD HH:MM]
   const oldMatch = content.match(
     /\[COMMITMENT:\s*(.+?)\s*\|\s*DEADLINE:\s*(.+?)\s*\]/
   );
   if (oldMatch) {
-    return { description: oldMatch[1], deadline: new Date(oldMatch[2]).toISOString() };
+    return {
+      description: oldMatch[1],
+      deadline: new Date(oldMatch[2]).toISOString(),
+      alreadySaved: false,
+    };
   }
 
   return null;
@@ -73,7 +101,7 @@ function parseCommitment(content: string): ParsedCommitment | null {
 
 function stripCommitmentTag(content: string): string {
   return content
-    .replace(/\[COMMITMENT:\s*.+?\|\s*(?:DEADLINE|WHEN):\s*.+?\]/, "")
+    .replace(/\[(?:SAVED_)?COMMITMENT:\s*.+?\|\s*(?:DEADLINE|WHEN):\s*.+?\]/, "")
     .trim();
 }
 
@@ -239,10 +267,28 @@ export default function ChatView({ intensity = 3 }: { intensity?: number }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           description: commitment.description,
-          deadline: new Date(commitment.deadline).toISOString(),
+          deadline: commitment.deadline,
         }),
       });
       setSavedCommitments((prev) => new Set(prev).add(msgId));
+
+      // Mark as saved in Supabase so it persists across tab switches
+      const msg = messages.find((m) => m.id === msgId);
+      if (msg) {
+        const updatedContent = msg.content
+          .replace(/\[COMMITMENT:/, "[SAVED_COMMITMENT:")
+          .replace(/\[COMMITMENT:/, "[SAVED_COMMITMENT:");
+        await supabase
+          .from("messages")
+          .update({ content: updatedContent })
+          .eq("id", msgId);
+        // Update local state too
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === msgId ? { ...m, content: updatedContent } : m
+          )
+        );
+      }
     } catch (err) {
       console.error("Failed to save commitment:", err);
     }
@@ -410,7 +456,7 @@ export default function ChatView({ intensity = 3 }: { intensity?: number }) {
           messages.map((msg) => {
             const commitment =
               msg.role === "assistant" ? parseCommitment(msg.content) : null;
-            const isSaved = savedCommitments.has(msg.id);
+            const isSaved = savedCommitments.has(msg.id) || (commitment?.alreadySaved ?? false);
             const isDismissed = dismissedCommitments.has(msg.id);
             const displayContent = commitment
               ? stripCommitmentTag(msg.content)

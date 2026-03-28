@@ -158,7 +158,17 @@ export function buildContextMessage(
   if (active.length > 0) {
     context += `\n### Active commitments:\n`;
     active.forEach((c) => {
-      context += `- "${c.description}" — due ${c.deadline}`;
+      // Format deadline in Pacific time so the AI doesn't get confused by UTC
+      const pacificDeadline = new Date(c.deadline).toLocaleString('en-US', {
+        timeZone: 'America/Los_Angeles',
+        weekday: 'long',
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      });
+      context += `- "${c.description}" — due ${pacificDeadline} Pacific`;
       if (c.times_rescheduled > 0) {
         context += ` (rescheduled ${c.times_rescheduled} time${c.times_rescheduled > 1 ? "s" : ""})`;
       }
