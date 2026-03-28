@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import {
-  MANRIKI_SYSTEM_PROMPT,
+  getSystemPrompt,
   buildContextMessage,
 } from "@/lib/coaching";
 
@@ -26,13 +26,14 @@ export async function POST(req: NextRequest) {
     // Save user message
     await supabase.from("messages").insert({ role: "user", content: message });
 
-    // Fetch context: recent messages, commitments, check-ins
+    // Fetch context: recent messages (limited to last 20 to prevent loops),
+    // commitments, and check-ins
     const [messagesRes, commitmentsRes, checkInsRes] = await Promise.all([
       supabase
         .from("messages")
         .select("role, content")
-        .order("created_at", { ascending: true })
-        .limit(40),
+        .order("created_at", { ascending: false })
+        .limit(20),
       supabase
         .from("commitments")
         .select("id, description, deadline, status, times_rescheduled, missed_reason")
@@ -45,11 +46,8 @@ export async function POST(req: NextRequest) {
         .limit(15),
     ]);
 
-    // Build conversation history for Claude
-    const recentMessages = (messagesRes.data || []).map((m) => ({
-      role: m.role as "user" | "assistant",
-      content: m.content,
-    }));
+    // Reverse so they're in chronological order, and skip the message we just saved
+    const recentMessages = (messagesRes.data || []).reverse();
 
     // Build commitment context
     const commitments = commitmentsRes.data || [];
@@ -66,54 +64,73 @@ export async function POST(req: NextRequest) {
 
     const contextMessage = buildContextMessage(commitments, checkIns);
 
-    // Build the messages array for Claude
-    const claudeMessages = [
-      {
-        role: "user" as const,
-        content: `[SYSTEM CONTEXT — not visible to user]\n${contextMessage}\n[END CONTEXT]\n\nThe user's message: ${message}`,
-      },
-      // Include recent history for continuity (skip the context-injected first message)
-      ...recentMessages.slice(0, -1).map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      })),
-    ];
+    // Build messages for Claude — keep it clean and simple
+    // First message includes context, then conversation history follows
+    const conversationHistory = recentMessages.slice(0, -1); // exclude the message we just saved
 
-    // If we have history, restructure so context is first, then history, then current message
-    let finalMessages: { role: "user" | "assistant"; content: string }[];
+    let finalMessages: { role: "user" | "assistant"; content: string }[] = [];
 
-    if (recentMessages.length > 1) {
-      // History exists: context + history + current message
-      const history = recentMessages.slice(0, -1); // everything except the message we just saved
-      finalMessages = [
-        {
-          role: "user" as const,
-          content: `[SYSTEM CONTEXT — do not mention this to the user]\n${contextMessage}\n[END CONTEXT]\n\n${history[0]?.content || message}`,
-        },
-        ...history.slice(1),
-        { role: "user" as const, content: message },
-      ];
+    if (conversationHistory.length > 0) {
+      // Take only the last 16 messages to keep context focused
+      const trimmedHistory = conversationHistory.slice(-16);
 
-      // Ensure messages alternate user/assistant
-      // If we end up with two user messages in a row, merge them
-      const cleaned: typeof finalMessages = [];
-      for (const msg of finalMessages) {
-        if (
-          cleaned.length > 0 &&
-          cleaned[cleaned.length - 1].role === msg.role
-        ) {
-          cleaned[cleaned.length - 1].content += "\n" + msg.content;
-        } else {
-          cleaned.push(msg);
+      // Ensure the first message is from the user (required by Claude API)
+      let startIdx = 0;
+      for (let i = 0; i < trimmedHistory.length; i++) {
+        if (trimmedHistory[i].role === "user") {
+          startIdx = i;
+          break;
         }
       }
-      finalMessages = cleaned;
+
+      const validHistory = trimmedHistory.slice(startIdx);
+
+      // Build final messages: context injected into first user message
+      if (validHistory.length > 0 && validHistory[0].role === "user") {
+        finalMessages.push({
+          role: "user",
+          content: `[CONTEXT]\n${contextMessage}\n[/CONTEXT]\n\n${validHistory[0].content}`,
+        });
+
+        // Add remaining history
+        for (let i = 1; i < validHistory.length; i++) {
+          const msg = validHistory[i];
+          // Ensure alternating roles — merge if same role appears twice
+          if (
+            finalMessages.length > 0 &&
+            finalMessages[finalMessages.length - 1].role === msg.role
+          ) {
+            finalMessages[finalMessages.length - 1].content += "\n" + msg.content;
+          } else {
+            finalMessages.push({
+              role: msg.role as "user" | "assistant",
+              content: msg.content,
+            });
+          }
+        }
+
+        // Add current message
+        const lastMsg = finalMessages[finalMessages.length - 1];
+        if (lastMsg.role === "user") {
+          lastMsg.content += "\n" + message;
+        } else {
+          finalMessages.push({ role: "user", content: message });
+        }
+      } else {
+        // Fallback: just send context + current message
+        finalMessages = [
+          {
+            role: "user",
+            content: `[CONTEXT]\n${contextMessage}\n[/CONTEXT]\n\n${message}`,
+          },
+        ];
+      }
     } else {
       // First message ever
       finalMessages = [
         {
-          role: "user" as const,
-          content: `[SYSTEM CONTEXT — do not mention this to the user]\n${contextMessage}\n[END CONTEXT]\n\n${message}`,
+          role: "user",
+          content: `[CONTEXT]\n${contextMessage}\n[/CONTEXT]\n\n${message}`,
         },
       ];
     }
@@ -121,8 +138,8 @@ export async function POST(req: NextRequest) {
     // Call Claude
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 500,
-      system: MANRIKI_SYSTEM_PROMPT,
+      max_tokens: 300, // Reduced from 500 to enforce brevity
+      system: getSystemPrompt(),
       messages: finalMessages,
     });
 
